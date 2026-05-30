@@ -1,0 +1,91 @@
+name: weft-driver-qemu → OCI
+
+# Builds the pure-Go QEMU driver plugin for each supported (os,arch) and
+# publishes a single multi-arch OCI image to GHCR, so weft can pull it at
+# runtime (driverplugins: local-first, else OCI). The plugin is CGO_ENABLED=0,
+# so all targets cross-compile on one ubuntu runner.
+#
+# Packaging convention consumed by weft/driverplugins:
+#   ghcr.io/openweft/weft-driver-qemu:<tag>  = OCI image index
+#     └─ per-(os,arch) image manifest
+#          ├─ config: {"os":…,"architecture":…}   ← index platform selection
+#          └─ layer[0]: the raw weft-driver-qemu executable
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "OCI tag (default: v<short-sha>)"
+        required: false
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  BINARY: weft-driver-qemu
+  BINARY_MEDIATYPE: application/vnd.openweft.driver.binary
+  ARTIFACT_TYPE: application/vnd.openweft.weft-driver
+
+jobs:
+  build-publish:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+
+      - name: Cross-compile the plugin for every target
+        run: |
+          set -euo pipefail
+          # os/arch pairs weft runs on. amd64 + arm64 Linux hosts, Apple-silicon
+          # + Intel Macs (the QEMU driver also runs on macOS as a fallback).
+          targets="linux/amd64 linux/arm64 darwin/arm64 darwin/amd64"
+          for t in $targets; do
+            os="${t%/*}"; arch="${t#*/}"
+            out="stage/${os}-${arch}/${BINARY}"
+            mkdir -p "$(dirname "$out")"
+            CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" \
+              go build -trimpath -o "$out" ./cmd/${BINARY}
+          done
+          ls -lhR stage
+
+      - name: Install ORAS
+        uses: oras-project/setup-oras@v1
+
+      - name: Log in to GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" \
+            | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Push per-arch images + assemble the multi-arch index
+        run: |
+          set -euo pipefail
+          repo="ghcr.io/${{ github.repository_owner }}/${BINARY}"
+          tag="${{ inputs.tag }}"; [ -n "$tag" ] || tag="v${GITHUB_SHA::12}"
+
+          children=""
+          for d in stage/*/; do
+            platform="$(basename "$d")"        # e.g. linux-arm64
+            os="${platform%-*}"; arch="${platform#*-}"
+            # An OCI image config carrying the platform → the index picks on it.
+            printf '{"architecture":"%s","os":"%s"}' "$arch" "$os" > "$d/config.json"
+            child="${repo}:${tag}-${platform}"
+            ( cd "$d" && oras push "$child" \
+                --artifact-type "${ARTIFACT_TYPE}" \
+                --config config.json:application/vnd.oci.image.config.v1+json \
+                --annotation "org.opencontainers.image.source=https://github.com/${{ github.repository }}" \
+                --annotation "org.opencontainers.image.revision=${GITHUB_SHA}" \
+                "${BINARY}:${BINARY_MEDIATYPE}" )
+            children="$children $child"
+          done
+
+          # Combine the per-arch manifests into one multi-arch index under :<tag>,
+          # then move the floating :latest tag (weft pins by digest after pull).
+          oras manifest index create "${repo}:${tag}" $children
+          oras tag "${repo}:${tag}" latest
+          echo "Published ${repo}:${tag} (+ :latest) for: $children"
