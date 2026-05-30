@@ -4,7 +4,7 @@
 // that needs no KVM/HVF and thus no nested virtualization. That makes it the
 // driver to reach for in a non-nested dev VM (e.g. a macOS Tart guest) where
 // Apple VZ can't create VMs: QEMU/TCG still boots a real Linux micro-VM,
-// slowly but really, so the in-guest stack (weft-init, wg0, weft-vm-agent,
+// slowly but really, so the in-guest stack (weft-init, wg0, weft-microvm-agent,
 // mesh) can be exercised end to end.
 //
 // VM lifetime follows the same transitional convention as weft-driver-vz:
