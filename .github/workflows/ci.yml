@@ -1,0 +1,43 @@
+name: CI
+
+# weft-driver-qemu is the QEMU/KVM driver — pure-Go, CGO=0. Linux is the
+# canonical runtime (KVM is Linux-only) but the binary cross-builds for
+# darwin too (QEMU/TCG dev backend per memory env_no_nested_virt). No
+# publish here — driver-oci.yml owns OCI release.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        goos:   [linux, darwin]
+        goarch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: vet
+        run: go vet ./...
+
+      - name: build (${{ matrix.goos }}/${{ matrix.goarch }})
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: go build ./...
+
+      - name: test
+        # Tests run on linux/amd64 only — cross-OS qemu probes require the
+        # actual hypervisor and that's an acceptance concern, not a CI gate.
+        if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
+        run: go test -race -count=1 ./...
