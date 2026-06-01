@@ -32,6 +32,19 @@ type bootConfig struct {
 	// so it works the same on Linux and macOS hosts. See
 	// [[qemu-microvm-9p]] in the project memory.
 	shares []shareArg
+	// pciPassthrough is the list of host PCI BDFs the operator wants
+	// passed through to the guest via VFIO. Resolved upstream (the
+	// scheduler picks a host carrying the requested vendor:device
+	// tuples, then weft-agent passes the concrete BDFs down).
+	//
+	// VFIO requires the host kernel to have unbound the native driver
+	// and bound vfio-pci first — weft does NOT do that today, it's
+	// part of the host's day-0 setup (see
+	// docs/operations/pci-passthrough.md). buildArgs just appends one
+	// -device vfio-pci,host=<BDF> per entry ; QEMU surfaces the
+	// "device or resource busy" error if the BDF isn't actually
+	// available for passthrough.
+	pciPassthrough []string
 }
 
 type diskArg struct {
@@ -153,6 +166,19 @@ func buildArgs(b bootConfig) ([]string, error) {
 		}
 		dev := fmt.Sprintf("virtio-9p-pci,fsdev=%s,mount_tag=%s", fsID, s.tag)
 		args = append(args, "-fsdev", fsdev, "-device", dev)
+	}
+
+	// PCI passthrough : one -device vfio-pci per resolved BDF. Order
+	// follows the input slice (the scheduler emits BDFs sorted by
+	// the host's inventory, which is itself sorted by BDF — so this
+	// is deterministic across runs). QEMU's vfio-pci device takes a
+	// `host=<BDF>` argument in the canonical 0000:bb:dd.f form,
+	// matching what /sys/bus/pci/devices uses.
+	for _, bdf := range b.pciPassthrough {
+		if bdf == "" {
+			continue
+		}
+		args = append(args, "-device", fmt.Sprintf("vfio-pci,host=%s", bdf))
 	}
 
 	if b.consolePath != "" {

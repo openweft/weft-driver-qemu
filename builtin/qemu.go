@@ -233,6 +233,23 @@ func (h *Hypervisor) DetachNIC(context.Context, string, string) error {
 	return drivers.ErrUnsupported
 }
 
+// ValidatePCIPassthrough accepts any BDF list — QEMU supports VFIO
+// passthrough through `-device vfio-pci,host=<BDF>` (wired in
+// builtin/args.go's buildArgs). The helper is symmetric with the
+// VZ driver's same-named method so the upper layer can call it
+// uniformly without driver-kind switches ; on QEMU it's always
+// nil because args.go does the actual attach.
+//
+// Returns nil even for nil / empty input — the "no passthrough"
+// case is the common one (every non-passthrough VM).
+//
+// The host kernel still needs vfio-pci bound to each BDF for the
+// run to succeed ; weft does NOT manage that today (see
+// docs/operations/pci-passthrough.md "vfio prep on the host").
+func (h *Hypervisor) ValidatePCIPassthrough(bdfs []string) error {
+	return nil
+}
+
 // ── helpers ────────────────────────────────────────────────────────────────
 
 type vmConfig struct {
