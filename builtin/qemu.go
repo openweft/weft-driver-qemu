@@ -195,7 +195,7 @@ func (h *Hypervisor) DeleteVM(_ context.Context, vmUUID string) error {
 // matching weft-driver-vz): when missing and SizeGiB > 0 it lazily creates a
 // raw image; SizeGiB == 0 with a missing file is an error. The boot disk is
 // the file named disk.img in the VM directory.
-func (h *Hypervisor) AttachDisk(_ context.Context, vmUUID string, disk drivers.DiskSpec) error {
+func (h *Hypervisor) AttachDisk(_ context.Context, vmUUID string, disk drivers.DiskSpec) (err error) {
 	path := disk.BackingPath
 	if path == "" {
 		path = filepath.Join(vmUUID, "disk.img")
@@ -213,7 +213,11 @@ func (h *Hypervisor) AttachDisk(_ context.Context, vmUUID string, disk drivers.D
 	if err != nil {
 		return fmt.Errorf("qemu AttachDisk: create %s: %w", path, err)
 	}
-	defer f.Close()
+	defer func() {
+		if cerr := f.Close(); cerr != nil && err == nil {
+			err = fmt.Errorf("qemu AttachDisk: close %s: %w", path, cerr)
+		}
+	}()
 	if err := f.Truncate(int64(disk.SizeGiB) << 30); err != nil {
 		return fmt.Errorf("qemu AttachDisk: size %s: %w", path, err)
 	}
