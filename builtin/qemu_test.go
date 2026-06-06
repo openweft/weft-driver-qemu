@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	drivers "github.com/openweft/weft-drivers"
 )
@@ -154,6 +155,19 @@ func TestStartVM_SpawnsAndRecordsPID(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, "vm.pid")); err != nil {
 		t.Errorf("vm.pid not written: %v", err)
+	}
+	// The reaper goroutine writes exit.json once the stub process exits.
+	// Wait for it (and assert) so t.TempDir's RemoveAll doesn't race the
+	// goroutine's write.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(filepath.Join(dir, "exit.json")); err == nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "exit.json")); err != nil {
+		t.Errorf("exit.json not written by reaper goroutine: %v", err)
 	}
 	// Stop must be a no-op-safe call even though the stub already exited.
 	if err := h.StopVM(context.Background(), dir); err != nil {

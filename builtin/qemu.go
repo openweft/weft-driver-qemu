@@ -25,6 +25,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	drivers "github.com/openweft/weft-drivers"
 )
@@ -158,9 +159,36 @@ func (h *Hypervisor) StartVM(_ context.Context, vmUUID string) error {
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("qemu StartVM: launch %s: %w", h.opts.QemuBinary, err)
 	}
-	if err := os.WriteFile(filepath.Join(vmDir, "vm.pid"), []byte(strconv.Itoa(cmd.Process.Pid)), 0o600); err != nil {
+	pid := cmd.Process.Pid
+	if err := os.WriteFile(filepath.Join(vmDir, "vm.pid"), []byte(strconv.Itoa(pid)), 0o600); err != nil {
 		return fmt.Errorf("qemu StartVM: write pid: %w", err)
 	}
+	// Reap the qemu child when it exits. Without this, a microVM whose
+	// guest powers itself off (init-failure, normal `poweroff`, panic, ...)
+	// becomes a zombie in the process table AND the next StatusVM call
+	// still reads vm.pid → os.FindProcess succeeds → reported "running"
+	// even though the guest is gone. Writing exit.json once Wait returns
+	// lets readPID + statusFromExitFile flip the reported state on the
+	// next probe without requiring the agent to poll qemu directly.
+	go func() {
+		err := cmd.Wait()
+		out := map[string]any{
+			"pid":          pid,
+			"exited_at_ns": time.Now().UnixNano(),
+		}
+		if err != nil {
+			out["error"] = err.Error()
+		}
+		if ee, ok := err.(*exec.ExitError); ok {
+			out["exit_code"] = ee.ExitCode()
+		} else if err == nil {
+			out["exit_code"] = 0
+		}
+		blob, _ := json.Marshal(out)
+		// Best-effort write — if the vmDir is gone (DeleteVM raced) we
+		// just stop here ; the parent's reap is what mattered.
+		_ = os.WriteFile(filepath.Join(vmDir, "exit.json"), blob, 0o600)
+	}()
 	return nil
 }
 

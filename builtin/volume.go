@@ -40,3 +40,31 @@ func (v *Volume) AttachVolume(context.Context, string, string) (drivers.Attached
 	return drivers.AttachedVolume{}, drivers.ErrUnsupported
 }
 func (v *Volume) DetachVolume(context.Context, string, string) error { return drivers.ErrUnsupported }
+
+// Snapshot + backup ops are unsupported for the file backend ; weft-block
+// is the documented home for that surface. These stubs land here so the
+// driver still satisfies the drivers.VolumeDriver interface as it grows.
+func (v *Volume) CreateSnapshot(context.Context, drivers.SnapshotSpec) (drivers.Snapshot, error) {
+	return drivers.Snapshot{}, drivers.ErrUnsupported
+}
+func (v *Volume) ListSnapshots(context.Context, string) ([]drivers.Snapshot, error) {
+	return nil, drivers.ErrUnsupported
+}
+func (v *Volume) DeleteSnapshot(context.Context, string, string) error {
+	return drivers.ErrUnsupported
+}
+func (v *Volume) RevertSnapshot(context.Context, string, string) error {
+	return drivers.ErrUnsupported
+}
+func (v *Volume) CreateBackup(context.Context, drivers.BackupSpec) (drivers.Backup, error) {
+	return drivers.Backup{}, drivers.ErrUnsupported
+}
+func (v *Volume) ListBackups(context.Context, string, string) ([]drivers.Backup, error) {
+	return nil, drivers.ErrUnsupported
+}
+func (v *Volume) DeleteBackup(context.Context, string) error {
+	return drivers.ErrUnsupported
+}
+func (v *Volume) RestoreBackup(context.Context, string, drivers.VolumeSpec) error {
+	return drivers.ErrUnsupported
+}
