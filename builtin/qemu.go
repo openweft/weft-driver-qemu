@@ -107,6 +107,11 @@ func (h *Hypervisor) StartVM(_ context.Context, vmUUID string) error {
 	if alive, _ := pidAlive(vmDir); alive {
 		return nil
 	}
+	// Clear any stale exit.json from a previous run before we relaunch ;
+	// otherwise a restart after a crash would leave the old descriptor
+	// in place and downstream status readers would mis-report the new
+	// process as already exited.
+	_ = os.Remove(filepath.Join(vmDir, "exit.json"))
 
 	kernel := filepath.Join(vmDir, "kernel")
 	if _, err := os.Stat(kernel); err != nil {
@@ -186,8 +191,14 @@ func (h *Hypervisor) StartVM(_ context.Context, vmUUID string) error {
 		}
 		blob, _ := json.Marshal(out)
 		// Best-effort write — if the vmDir is gone (DeleteVM raced) we
-		// just stop here ; the parent's reap is what mattered.
-		_ = os.WriteFile(filepath.Join(vmDir, "exit.json"), blob, 0o600)
+		// just stop here ; the parent's reap is what mattered. Write
+		// atomically (tmp + rename) so a concurrent status reader can
+		// never observe a half-written JSON document.
+		tmp := filepath.Join(vmDir, "exit.json.tmp")
+		final := filepath.Join(vmDir, "exit.json")
+		if werr := os.WriteFile(tmp, blob, 0o600); werr == nil {
+			_ = os.Rename(tmp, final)
+		}
 	}()
 	return nil
 }
