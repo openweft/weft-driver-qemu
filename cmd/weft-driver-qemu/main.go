@@ -9,11 +9,13 @@
 package main
 
 import (
+	"log/slog"
 	"os"
 	"strconv"
 
 	weftplugin "github.com/openweft/weft-driver-plugin"
 	qemudriver "github.com/openweft/weft-driver-qemu/builtin"
+	weftslognats "github.com/openweft/weft-slognats"
 )
 
 // envInt reads an int env var, returning 0 when unset or malformed so the
@@ -38,11 +40,16 @@ const (
 )
 
 func main() {
+	hostUUID := os.Getenv(weftplugin.EnvHostUUID)
+	log, logCloser := weftslognats.SetupFromEnv("weft.driver.qemu." + hostUUID + ".log")
+	defer logCloser.Close()
+	slog.SetDefault(log)
+
 	defMem := envInt(envQemuMemMiB)
 	defCPUs := envInt(envQemuCPUs)
 	b := qemudriver.New(qemudriver.BundleOptions{
 		Options: qemudriver.Options{
-			HostUUID:      os.Getenv(weftplugin.EnvHostUUID),
+			HostUUID:      hostUUID,
 			Hostname:      os.Getenv(weftplugin.EnvHostname),
 			QemuBinary:    os.Getenv(envQemuBinary),
 			Arch:          os.Getenv(envQemuArch),
