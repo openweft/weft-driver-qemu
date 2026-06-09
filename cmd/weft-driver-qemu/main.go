@@ -44,6 +44,10 @@ func main() {
 	log, logCloser := weftslognats.SetupFromEnv("weft.driver.qemu." + hostUUID + ".log")
 	defer logCloser.Close()
 	slog.SetDefault(log)
+	// Capture Go panics via NATS slog fan-out so weft-doctor sees
+	// driver-plugin crashes alongside agent crashes. Matches the
+	// pattern weft v0.4.9 introduced for the main agent.
+	defer weftslognats.PanicReporter("weft-driver-qemu")
 
 	defMem := envInt(envQemuMemMiB)
 	defCPUs := envInt(envQemuCPUs)

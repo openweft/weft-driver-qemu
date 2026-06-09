@@ -5,7 +5,7 @@ go 1.26
 require (
 	github.com/openweft/weft-driver-plugin v0.0.0
 	github.com/openweft/weft-drivers v0.2.0
-	github.com/openweft/weft-slognats v0.2.0
+	github.com/openweft/weft-slognats v0.3.0
 )
 
 require (
