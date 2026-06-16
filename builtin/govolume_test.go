@@ -18,15 +18,20 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 
+	volume "github.com/go-volumes/interface"
+	"github.com/go-volumes/pool"
 	drivers "github.com/openweft/weft-drivers"
 )
 
@@ -641,3 +646,572 @@ func (r *testRegistry) handle(w http.ResponseWriter, req *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
 	}
 }
+
+// ── error-branch coverage helpers ───────────────────────────────────────────
+
+// writeFile writes b to path, failing the test on error.
+func writeFile(t *testing.T, path string, b []byte) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("mkdir %s: %v", filepath.Dir(path), err)
+	}
+	if err := os.WriteFile(path, b, 0o644); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+}
+
+// makePoolWithoutDisk creates a real, valid pool file at path that carries a
+// volume OTHER than "disk", so OpenVolume("disk") on it fails — exercising the
+// "pool exists but the disk volume is absent" branches.
+func makePoolWithoutDisk(t *testing.T, path string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	p, err := pool.Create(path, 2*gib)
+	if err != nil {
+		t.Fatalf("pool.Create: %v", err)
+	}
+	if _, err := p.CreateVolume("other", gib); err != nil {
+		t.Fatalf("CreateVolume: %v", err)
+	}
+	if err := p.Close(); err != nil {
+		t.Fatalf("pool.Close: %v", err)
+	}
+}
+
+// withSeams swaps the production seams for the duration of fn and restores them,
+// so a failing test never leaks an override into a sibling test.
+func withSeams(t *testing.T, fn func()) {
+	t.Helper()
+	origPool, origDisk, origListen, origOpen := createPool, createDiskVolume, listenTCP, openVolume
+	t.Cleanup(func() {
+		createPool, createDiskVolume, listenTCP, openVolume = origPool, origDisk, origListen, origOpen
+	})
+	fn()
+}
+
+// ── fake volume devices for copyDevice / readFullAt / equalBytes ─────────────
+
+// errReadAt is a volume.ReadOnly whose ReadAt fails after sizeErr is honoured.
+type errReadAt struct {
+	size    int64
+	sizeErr error
+	readErr error
+}
+
+func (e errReadAt) ReadAt([]byte, int64) (int, error) { return 0, e.readErr }
+func (e errReadAt) Size() (int64, error)              { return e.size, e.sizeErr }
+func (e errReadAt) Close() error                      { return nil }
+
+// memReadOnly is an in-memory volume.ReadOnly over a fixed byte slice.
+type memReadOnly struct{ data []byte }
+
+func (m memReadOnly) ReadAt(p []byte, off int64) (int, error) {
+	if off >= int64(len(m.data)) {
+		return 0, io.EOF
+	}
+	n := copy(p, m.data[off:])
+	if n < len(p) {
+		return n, io.EOF
+	}
+	return n, nil
+}
+func (m memReadOnly) Size() (int64, error) { return int64(len(m.data)), nil }
+func (m memReadOnly) Close() error         { return nil }
+
+// shortThenFull reads 1 byte at a time (nil error) until the buffer is full,
+// exercising readFullAt's multi-iteration loop.
+type shortThenFull struct{ data []byte }
+
+func (s shortThenFull) ReadAt(p []byte, off int64) (int, error) {
+	if off >= int64(len(s.data)) {
+		return 0, io.EOF
+	}
+	p[0] = s.data[off]
+	return 1, nil
+}
+func (s shortThenFull) Size() (int64, error) { return int64(len(s.data)), nil }
+func (s shortThenFull) Close() error         { return nil }
+
+// errWriteDevice is a volume.Device whose WriteAt fails; reads come from data.
+type errWriteDevice struct {
+	data     []byte
+	writeErr error
+}
+
+func (e *errWriteDevice) ReadAt(p []byte, off int64) (int, error) {
+	if off >= int64(len(e.data)) {
+		return 0, io.EOF
+	}
+	return copy(p, e.data[off:]), nil
+}
+func (e *errWriteDevice) WriteAt([]byte, int64) (int, error) { return 0, e.writeErr }
+func (e *errWriteDevice) Size() (int64, error)               { return int64(len(e.data)), nil }
+func (e *errWriteDevice) Sync() error                        { return nil }
+func (e *errWriteDevice) Close() error                       { return nil }
+
+// ── EnsureVolume error branches ─────────────────────────────────────────────
+
+func TestGoVolumeEnsureErrorBranches(t *testing.T) {
+	ctx := context.Background()
+
+	// Existing-but-corrupt pool → pool.Open fails (bad magic).
+	t.Run("corrupt-pool-open", func(t *testing.T) {
+		v := newTestGoVolume(t)
+		writeFile(t, v.poolPath("vol-c"), []byte("not a pool"))
+		if err := v.EnsureVolume(ctx, drivers.VolumeSpec{UUID: "vol-c", SizeGiB: 1}); err == nil {
+			t.Errorf("want open error on corrupt pool")
+		}
+	})
+
+	// Existing valid pool that lacks the "disk" volume → OpenVolume fails.
+	t.Run("missing-disk-volume", func(t *testing.T) {
+		v := newTestGoVolume(t)
+		makePoolWithoutDisk(t, v.poolPath("vol-nd"))
+		if err := v.EnsureVolume(ctx, drivers.VolumeSpec{UUID: "vol-nd", SizeGiB: 1}); err == nil {
+			t.Errorf("want open-disk-volume error")
+		}
+	})
+
+	// mkdir fails: a regular file sits where the per-UUID dir must go.
+	t.Run("mkdir-fails", func(t *testing.T) {
+		v := newTestGoVolume(t)
+		writeFile(t, v.volDir("vol-m"), []byte("i am a file, not a dir"))
+		if err := v.EnsureVolume(ctx, drivers.VolumeSpec{UUID: "vol-m", SizeGiB: 1}); err == nil {
+			t.Errorf("want mkdir error")
+		}
+	})
+
+	// pool.Create fails (seam).
+	t.Run("create-pool-fails", func(t *testing.T) {
+		v := newTestGoVolume(t)
+		withSeams(t, func() {
+			createPool = func(string, int64) (*pool.Pool, error) { return nil, errors.New("create boom") }
+			if err := v.EnsureVolume(ctx, drivers.VolumeSpec{UUID: "vol-cp", SizeGiB: 1}); err == nil {
+				t.Errorf("want create-pool error")
+			}
+		})
+	})
+
+	// CreateVolume fails (seam) — a fresh pool never rejects its first volume in
+	// practice, so the only way to drive this defensive branch is the seam.
+	t.Run("create-disk-volume-fails", func(t *testing.T) {
+		v := newTestGoVolume(t)
+		withSeams(t, func() {
+			createDiskVolume = func(*pool.Pool, string, int64) (*pool.Volume, error) {
+				return nil, errors.New("createvolume boom")
+			}
+			if err := v.EnsureVolume(ctx, drivers.VolumeSpec{UUID: "vol-cv", SizeGiB: 1}); err == nil {
+				t.Errorf("want create-disk-volume error")
+			}
+		})
+	})
+}
+
+// ── AttachVolume error + race branches ──────────────────────────────────────
+
+func TestGoVolumeAttachErrorBranches(t *testing.T) {
+	ctx := context.Background()
+
+	// Pool exists but has no "disk" volume → OpenVolume fails (and the pool is
+	// closed on that path).
+	t.Run("open-disk-volume-fails", func(t *testing.T) {
+		v := newTestGoVolume(t)
+		makePoolWithoutDisk(t, v.poolPath("vol-nd"))
+		if _, err := v.AttachVolume(ctx, "vol-nd", "h"); err == nil {
+			t.Errorf("want open-disk-volume error")
+		}
+	})
+
+	// Listener creation fails (seam).
+	t.Run("listen-fails", func(t *testing.T) {
+		v := newTestGoVolume(t)
+		if err := v.EnsureVolume(ctx, drivers.VolumeSpec{UUID: "vol-l", SizeGiB: 1}); err != nil {
+			t.Fatalf("EnsureVolume: %v", err)
+		}
+		withSeams(t, func() {
+			listenTCP = func(string) (net.Listener, error) { return nil, errors.New("listen boom") }
+			if _, err := v.AttachVolume(ctx, "vol-l", "h"); err == nil {
+				t.Errorf("want listen error")
+			}
+		})
+	})
+
+	// Lost-the-race: another attach populated the map between the first unlock
+	// and the re-lock. Drive it deterministically by having the listen seam
+	// insert a competing server under the same key before returning; AttachVolume
+	// then closes its own server and returns the winner's address.
+	t.Run("lost-attach-race", func(t *testing.T) {
+		v := newTestGoVolume(t)
+		if err := v.EnsureVolume(ctx, drivers.VolumeSpec{UUID: "vol-race", SizeGiB: 1}); err != nil {
+			t.Fatalf("EnsureVolume: %v", err)
+		}
+		key := attachKey("vol-race", "h")
+		withSeams(t, func() {
+			listenTCP = func(addr string) (net.Listener, error) {
+				ln, err := net.Listen("tcp", addr)
+				if err != nil {
+					return nil, err
+				}
+				// Simulate a concurrent winner already in the map.
+				v.mu.Lock()
+				v.servers[key] = &nbdServer{addr: "nbd://winner:1"}
+				v.mu.Unlock()
+				return ln, nil
+			}
+			att, err := v.AttachVolume(ctx, "vol-race", "h")
+			if err != nil {
+				t.Fatalf("AttachVolume: %v", err)
+			}
+			if att.BackingPath != "nbd://winner:1" {
+				t.Errorf("BackingPath = %q, want the race winner's addr", att.BackingPath)
+			}
+		})
+		// Clean up the planted winner (it has a nil listener; drop it directly).
+		v.mu.Lock()
+		delete(v.servers, key)
+		v.mu.Unlock()
+	})
+}
+
+// ── nbdServer.close: pool.Close error path ──────────────────────────────────
+
+// failCloseBacking is a pool.Backing whose Close errors, so the *pool.Pool it
+// backs returns that error from Close — the only realistic trigger for
+// nbdServer.close's pool-error branch.
+type failCloseBacking struct {
+	data []byte
+}
+
+func (b *failCloseBacking) ReadAt(p []byte, off int64) (int, error) {
+	if off >= int64(len(b.data)) {
+		return 0, io.EOF
+	}
+	n := copy(p, b.data[off:])
+	if n < len(p) {
+		return n, io.EOF
+	}
+	return n, nil
+}
+func (b *failCloseBacking) WriteAt(p []byte, off int64) (int, error) {
+	if end := off + int64(len(p)); end > int64(len(b.data)) {
+		grown := make([]byte, end)
+		copy(grown, b.data)
+		b.data = grown
+	}
+	return copy(b.data[off:], p), nil
+}
+func (b *failCloseBacking) Truncate(size int64) error {
+	if size > int64(len(b.data)) {
+		grown := make([]byte, size)
+		copy(grown, b.data)
+		b.data = grown
+	} else {
+		b.data = b.data[:size]
+	}
+	return nil
+}
+func (b *failCloseBacking) Sync() error  { return nil }
+func (b *failCloseBacking) Close() error { return errors.New("backing close boom") }
+
+func TestNbdServerCloseReturnsPoolError(t *testing.T) {
+	p, err := pool.CreateWith(&failCloseBacking{}, 2*gib, 4096)
+	if err != nil {
+		t.Fatalf("pool.CreateWith: %v", err)
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	done := make(chan struct{})
+	close(done) // Serve already "drained".
+	s := &nbdServer{ln: ln, pool: p, done: done}
+	if err := s.close(); err == nil {
+		t.Errorf("close: want pool.Close error from failing backing, got nil")
+	}
+}
+
+// ── CreateSnapshot: pool.Snapshot error branch (duplicate name) ─────────────
+
+func TestGoVolumeCreateSnapshotDuplicate(t *testing.T) {
+	v := newTestGoVolume(t)
+	ctx := context.Background()
+	if err := v.EnsureVolume(ctx, drivers.VolumeSpec{UUID: "vol-dup", SizeGiB: 1}); err != nil {
+		t.Fatalf("EnsureVolume: %v", err)
+	}
+	if _, err := v.CreateSnapshot(ctx, drivers.SnapshotSpec{VolumeUUID: "vol-dup", Name: "snap1"}); err != nil {
+		t.Fatalf("CreateSnapshot: %v", err)
+	}
+	// Same name again → pool.Snapshot returns ErrExists.
+	if _, err := v.CreateSnapshot(ctx, drivers.SnapshotSpec{VolumeUUID: "vol-dup", Name: "snap1"}); err == nil {
+		t.Errorf("CreateSnapshot duplicate: want error")
+	}
+}
+
+// ── ListSnapshots: OpenVolume error inside the loop is skipped ───────────────
+//
+// A name reaching the loop came straight from p.Volumes(), so a real
+// OpenVolume can only fail if the volume vanished concurrently — unreachable
+// through the public pool API. The openVolume seam drives that defensive skip:
+// it fails for one listed snapshot, which ListSnapshots silently drops.
+func TestGoVolumeListSnapshotsSkipsUnopenable(t *testing.T) {
+	v := newTestGoVolume(t)
+	ctx := context.Background()
+	if err := v.EnsureVolume(ctx, drivers.VolumeSpec{UUID: "vol-ph", SizeGiB: 1}); err != nil {
+		t.Fatalf("EnsureVolume: %v", err)
+	}
+	if _, err := v.CreateSnapshot(ctx, drivers.SnapshotSpec{VolumeUUID: "vol-ph", Name: "good"}); err != nil {
+		t.Fatalf("CreateSnapshot good: %v", err)
+	}
+	if _, err := v.CreateSnapshot(ctx, drivers.SnapshotSpec{VolumeUUID: "vol-ph", Name: "bad"}); err != nil {
+		t.Fatalf("CreateSnapshot bad: %v", err)
+	}
+
+	withSeams(t, func() {
+		openVolume = func(p *pool.Pool, name string) (*pool.Volume, error) {
+			if name == "bad" {
+				return nil, errors.New("vanished")
+			}
+			return p.OpenVolume(name)
+		}
+		snaps, err := v.ListSnapshots(ctx, "vol-ph")
+		if err != nil {
+			t.Fatalf("ListSnapshots: %v", err)
+		}
+		if len(snaps) != 1 || snaps[0].Name != "good" {
+			t.Fatalf("ListSnapshots = %+v, want only [good] ('bad' skipped)", snaps)
+		}
+	})
+}
+
+// ── restoreInto: every post-open error branch via fakes ─────────────────────
+
+func TestRestoreIntoErrorBranches(t *testing.T) {
+	ctx := context.Background()
+	_ = ctx
+
+	// img.Size() error (defensive; the real oci.Image never errs here).
+	t.Run("image-size-fails", func(t *testing.T) {
+		v := newTestGoVolume(t)
+		img := errReadAt{sizeErr: errors.New("size boom")}
+		if err := v.restoreInto(drivers.VolumeSpec{UUID: "r-sz", SizeGiB: 1}, img); err == nil {
+			t.Errorf("want image-size error")
+		}
+	})
+
+	// Requested size larger than the image → grow path (size = want).
+	t.Run("grow-to-requested-size", func(t *testing.T) {
+		v := newTestGoVolume(t)
+		img := memReadOnly{data: bytes.Repeat([]byte("Z"), 4096)}
+		if err := v.restoreInto(drivers.VolumeSpec{UUID: "r-grow", SizeGiB: 1}, img); err != nil {
+			t.Fatalf("restoreInto grow: %v", err)
+		}
+		// The disk must be at least the requested 1 GiB.
+		p, err := pool.Open(v.poolPath("r-grow"))
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		defer p.Close()
+		vol, err := p.OpenVolume(diskVolumeName)
+		if err != nil {
+			t.Fatalf("OpenVolume: %v", err)
+		}
+		if sz, _ := vol.Size(); sz < gib {
+			t.Errorf("disk size %d < 1 GiB (grow not honoured)", sz)
+		}
+	})
+
+	// mkdir fails: a file occupies the per-UUID dir path.
+	t.Run("mkdir-fails", func(t *testing.T) {
+		v := newTestGoVolume(t)
+		writeFile(t, v.volDir("r-mk"), []byte("file"))
+		img := memReadOnly{data: []byte("data")}
+		if err := v.restoreInto(drivers.VolumeSpec{UUID: "r-mk", SizeGiB: 1}, img); err == nil {
+			t.Errorf("want mkdir error")
+		}
+	})
+
+	// pool.Create fails (seam).
+	t.Run("create-pool-fails", func(t *testing.T) {
+		v := newTestGoVolume(t)
+		withSeams(t, func() {
+			createPool = func(string, int64) (*pool.Pool, error) { return nil, errors.New("create boom") }
+			img := memReadOnly{data: []byte("data")}
+			if err := v.restoreInto(drivers.VolumeSpec{UUID: "r-cp", SizeGiB: 1}, img); err == nil {
+				t.Errorf("want create-pool error")
+			}
+		})
+	})
+
+	// CreateVolume fails (seam).
+	t.Run("create-disk-volume-fails", func(t *testing.T) {
+		v := newTestGoVolume(t)
+		withSeams(t, func() {
+			createDiskVolume = func(*pool.Pool, string, int64) (*pool.Volume, error) {
+				return nil, errors.New("cv boom")
+			}
+			img := memReadOnly{data: []byte("data")}
+			if err := v.restoreInto(drivers.VolumeSpec{UUID: "r-cv", SizeGiB: 1}, img); err == nil {
+				t.Errorf("want create-disk-volume error")
+			}
+		})
+	})
+
+	// copyDevice fails: the image's ReadAt errors mid-copy (non-EOF).
+	t.Run("copy-read-fails", func(t *testing.T) {
+		v := newTestGoVolume(t)
+		img := errReadAt{size: 4096, readErr: errors.New("read boom")}
+		if err := v.restoreInto(drivers.VolumeSpec{UUID: "r-rd", SizeGiB: 1}, img); err == nil {
+			t.Errorf("want materialise (read) error")
+		}
+	})
+}
+
+// ── copyDevice / readFullAt / equalBytes unit branches ──────────────────────
+
+func TestCopyDeviceBranches(t *testing.T) {
+	// Multi-window non-zero copy: 1 MiB + a partial tail window, all non-zero,
+	// so dst.WriteAt is exercised across windows.
+	t.Run("multi-window-nonzero", func(t *testing.T) {
+		n := int64((1 << 20) + 4096)
+		src := memReadOnly{data: bytes.Repeat([]byte{0xAB}, int(n))}
+		var dst memDevice
+		dst.data = make([]byte, n)
+		if err := copyDevice(&dst, src, n); err != nil {
+			t.Fatalf("copyDevice: %v", err)
+		}
+		if !bytes.Equal(dst.data, src.data) {
+			t.Errorf("copyDevice content mismatch")
+		}
+	})
+
+	// All-zero copy stays sparse: no WriteAt calls.
+	t.Run("all-zero-skips-write", func(t *testing.T) {
+		n := int64(8192)
+		src := memReadOnly{data: make([]byte, n)}
+		dst := &errWriteDevice{data: make([]byte, n), writeErr: errors.New("must not be called")}
+		if err := copyDevice(dst, src, n); err != nil {
+			t.Fatalf("copyDevice all-zero: %v", err)
+		}
+	})
+
+	// Read failure mid-copy propagates.
+	t.Run("read-fails", func(t *testing.T) {
+		src := errReadAt{size: 4096, readErr: errors.New("read boom")}
+		var dst memDevice
+		dst.data = make([]byte, 4096)
+		if err := copyDevice(&dst, src, 4096); err == nil {
+			t.Errorf("want read error")
+		}
+	})
+
+	// Write failure on a non-zero window propagates.
+	t.Run("write-fails", func(t *testing.T) {
+		n := int64(4096)
+		src := memReadOnly{data: bytes.Repeat([]byte{1}, int(n))}
+		dst := &errWriteDevice{data: make([]byte, n), writeErr: errors.New("write boom")}
+		if err := copyDevice(dst, src, n); err == nil {
+			t.Errorf("want write error")
+		}
+	})
+}
+
+func TestReadFullAtBranches(t *testing.T) {
+	// Multi-iteration short reads filling the buffer, then a clean finish.
+	t.Run("short-reads-then-full", func(t *testing.T) {
+		data := []byte("0123456789")
+		src := shortThenFull{data: data}
+		buf := make([]byte, len(data))
+		if err := readFullAt(src, buf, 0); err != nil {
+			t.Fatalf("readFullAt: %v", err)
+		}
+		if !bytes.Equal(buf, data) {
+			t.Errorf("readFullAt got %q want %q", buf, data)
+		}
+	})
+
+	// Tail EOF returned TOGETHER with the final bytes once the buffer is exactly
+	// full → nil (the (n>0, io.EOF) convention an io.ReaderAt may use).
+	t.Run("tail-eof-when-full", func(t *testing.T) {
+		src := eofWithData{data: []byte("abcd")}
+		buf := make([]byte, 4)
+		if err := readFullAt(src, buf, 0); err != nil {
+			t.Errorf("readFullAt tail-EOF: want nil, got %v", err)
+		}
+	})
+
+	// Non-EOF error propagates.
+	t.Run("read-error", func(t *testing.T) {
+		src := errReadAt{readErr: errors.New("boom")}
+		buf := make([]byte, 8)
+		if err := readFullAt(src, buf, 0); err == nil {
+			t.Errorf("want read error")
+		}
+	})
+
+	// Premature EOF before the buffer is full → returns the EOF.
+	t.Run("short-eof", func(t *testing.T) {
+		src := memReadOnly{data: []byte("ab")}
+		buf := make([]byte, 8)
+		if err := readFullAt(src, buf, 0); err == nil {
+			t.Errorf("want EOF before full")
+		}
+	})
+}
+
+func TestEqualBytes(t *testing.T) {
+	if !equalBytes([]byte("abc"), []byte("abc")) {
+		t.Errorf("equalBytes equal: want true")
+	}
+	if equalBytes([]byte("abc"), []byte("abd")) {
+		t.Errorf("equalBytes differing byte: want false")
+	}
+	if equalBytes([]byte("abc"), []byte("ab")) {
+		t.Errorf("equalBytes differing length: want false")
+	}
+}
+
+// eofWithData returns its bytes AND io.EOF in the same ReadAt call (the
+// legitimate io.ReaderAt convention), so readFullAt's "EOF once full" branch is
+// reached with n == len(p).
+type eofWithData struct{ data []byte }
+
+func (e eofWithData) ReadAt(p []byte, off int64) (int, error) {
+	if off >= int64(len(e.data)) {
+		return 0, io.EOF
+	}
+	n := copy(p, e.data[off:])
+	return n, io.EOF
+}
+func (e eofWithData) Size() (int64, error) { return int64(len(e.data)), nil }
+func (e eofWithData) Close() error         { return nil }
+
+// memDevice is an in-memory volume.Device for copyDevice tests.
+type memDevice struct{ data []byte }
+
+func (m *memDevice) ReadAt(p []byte, off int64) (int, error) {
+	if off >= int64(len(m.data)) {
+		return 0, io.EOF
+	}
+	return copy(p, m.data[off:]), nil
+}
+func (m *memDevice) WriteAt(p []byte, off int64) (int, error) {
+	if off+int64(len(p)) > int64(len(m.data)) {
+		return 0, io.ErrShortWrite
+	}
+	return copy(m.data[off:], p), nil
+}
+func (m *memDevice) Size() (int64, error) { return int64(len(m.data)), nil }
+func (m *memDevice) Sync() error          { return nil }
+func (m *memDevice) Close() error         { return nil }
+
+// Compile-time checks that the fakes satisfy the go-volumes contracts.
+var (
+	_ volume.ReadOnly = errReadAt{}
+	_ volume.ReadOnly = memReadOnly{}
+	_ volume.ReadOnly = shortThenFull{}
+	_ volume.Device   = (*errWriteDevice)(nil)
+	_ volume.Device   = (*memDevice)(nil)
+)

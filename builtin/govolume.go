@@ -54,6 +54,25 @@ const poolOverheadGiB = 1
 // gib is one GiB in bytes.
 const gib = int64(1) << 30
 
+// Test seams: thin indirections over operations whose failure path is otherwise
+// unreachable through real injection (a freshly created pool never rejects its
+// first volume; binding 127.0.0.1:0 effectively never fails). Production wiring
+// is the plain library call; tests override these to exercise the error
+// branches and the lost-the-attach-race path.
+var (
+	createPool       = pool.Create
+	createDiskVolume = func(p *pool.Pool, name string, size int64) (*pool.Volume, error) {
+		return p.CreateVolume(name, size)
+	}
+	listenTCP = func(addr string) (net.Listener, error) { return net.Listen("tcp", addr) }
+	// openVolume opens a pool volume by name. Seamed so the defensive
+	// "listed-but-not-openable" skip in ListSnapshots — unreachable through the
+	// public pool API, since the name came straight from Volumes() — is testable.
+	openVolume = func(p *pool.Pool, name string) (*pool.Volume, error) {
+		return p.OpenVolume(name)
+	}
+)
+
 // GoVolumeOptions configures the go-volumes-backed volume driver.
 type GoVolumeOptions struct {
 	Options
@@ -157,12 +176,12 @@ func (v *GoVolume) EnsureVolume(_ context.Context, spec drivers.VolumeSpec) erro
 	// Reserve the requested size plus CoW/snapshot headroom. The pool file is
 	// sparse, so this is logical, not physical, allocation.
 	capBytes := wantBytes + poolOverheadGiB*gib
-	p, err := pool.Create(path, capBytes)
+	p, err := createPool(path, capBytes)
 	if err != nil {
 		return fmt.Errorf("govolume EnsureVolume: create pool %s: %w", path, err)
 	}
 	defer p.Close()
-	if _, err := p.CreateVolume(diskVolumeName, wantBytes); err != nil {
+	if _, err := createDiskVolume(p, diskVolumeName, wantBytes); err != nil {
 		return fmt.Errorf("govolume EnsureVolume: create disk volume: %w", err)
 	}
 	return p.Sync()
@@ -219,7 +238,7 @@ func (v *GoVolume) AttachVolume(_ context.Context, volumeUUID, hostUUID string) 
 		return drivers.AttachedVolume{}, fmt.Errorf("govolume AttachVolume: open disk volume: %w", err)
 	}
 
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := listenTCP("127.0.0.1:0")
 	if err != nil {
 		p.Close()
 		return drivers.AttachedVolume{}, fmt.Errorf("govolume AttachVolume: listen: %w", err)
@@ -339,7 +358,7 @@ func (v *GoVolume) ListSnapshots(_ context.Context, volumeUUID string) ([]driver
 		if n == diskVolumeName {
 			continue
 		}
-		vol, err := p.OpenVolume(n)
+		vol, err := openVolume(p, n)
 		if err != nil {
 			continue
 		}
@@ -426,6 +445,14 @@ func (v *GoVolume) RestoreBackup(ctx context.Context, backupURL string, spec dri
 	}
 	defer img.Close()
 
+	return v.restoreInto(spec, img)
+}
+
+// restoreInto materialises an opened frozen image into a fresh per-UUID pool.
+// It is split out of RestoreBackup so the post-open path (size negotiation,
+// directory + pool creation, sparse byte copy) is testable against a fake
+// volume.ReadOnly without standing up a registry.
+func (v *GoVolume) restoreInto(spec drivers.VolumeSpec, img volume.ReadOnly) error {
 	imgSize, err := img.Size()
 	if err != nil {
 		return fmt.Errorf("govolume RestoreBackup: image size: %w", err)
@@ -439,7 +466,7 @@ func (v *GoVolume) RestoreBackup(ctx context.Context, backupURL string, spec dri
 	if err := os.MkdirAll(v.volDir(spec.UUID), 0o755); err != nil {
 		return fmt.Errorf("govolume RestoreBackup: mkdir: %w", err)
 	}
-	p, err := pool.Create(v.poolPath(spec.UUID), size+poolOverheadGiB*gib)
+	p, err := createPool(v.poolPath(spec.UUID), size+poolOverheadGiB*gib)
 	if err != nil {
 		return fmt.Errorf("govolume RestoreBackup: create pool: %w", err)
 	}
@@ -448,7 +475,7 @@ func (v *GoVolume) RestoreBackup(ctx context.Context, backupURL string, spec dri
 	// Create the empty disk at the requested size, then overlay the frozen
 	// image bytes onto it. (ImportRaw can't be reused directly because it sizes
 	// the volume to the image; we may need a larger disk than the image.)
-	disk, err := p.CreateVolume(diskVolumeName, size)
+	disk, err := createDiskVolume(p, diskVolumeName, size)
 	if err != nil {
 		return fmt.Errorf("govolume RestoreBackup: create disk volume: %w", err)
 	}
