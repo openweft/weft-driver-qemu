@@ -45,6 +45,10 @@ const (
 	// Default OCI registry root for govolume backups (oci:// host part is
 	// taken from BackupSpec.Target; this is the fallback base URL).
 	envBackupRegistry = "WEFT_QEMU_BACKUP_REGISTRY"
+	// Optional OCI registry credentials presented on freeze / restore and on
+	// OCI-overlay open / commit. Empty → anonymous (weft-zot allows anon pull).
+	envRegistryUsername = "WEFT_QEMU_BACKUP_REGISTRY_USERNAME"
+	envRegistryPassword = "WEFT_QEMU_BACKUP_REGISTRY_PASSWORD"
 )
 
 func main() {
@@ -69,9 +73,11 @@ func main() {
 			DefaultMemMiB: defMem,
 			DefaultCPUs:   defCPUs,
 		},
-		StateDir:       os.Getenv(weftplugin.EnvStateDir),
-		VolumeBackend:  os.Getenv(envVolumeBackend),
-		BackupRegistry: os.Getenv(envBackupRegistry),
+		StateDir:         os.Getenv(weftplugin.EnvStateDir),
+		VolumeBackend:    os.Getenv(envVolumeBackend),
+		BackupRegistry:   os.Getenv(envBackupRegistry),
+		RegistryUsername: os.Getenv(envRegistryUsername),
+		RegistryPassword: os.Getenv(envRegistryPassword),
 	})
 	weftplugin.Serve(weftplugin.DriverSet{
 		Hypervisor: b.Hypervisor,

@@ -83,6 +83,13 @@ type GoVolumeOptions struct {
 	// "https://registry.example.com"). Empty disables the default; a backup
 	// then requires a target encoded in BackupSpec.Target.
 	BackupRegistry string
+	// RegistryUsername and RegistryPassword, when set, are presented to the OCI
+	// registry for HTTP Basic / bearer-token auth on every freeze, restore, and
+	// OCI-overlay open/commit. Empty means anonymous access. weft sources these
+	// from WEFT_QEMU_BACKUP_REGISTRY_USERNAME / _PASSWORD and points the registry
+	// at weft-zot.
+	RegistryUsername string
+	RegistryPassword string
 }
 
 // GoVolume implements drivers.VolumeDriver against the go-volumes stack. It is
@@ -92,17 +99,24 @@ type GoVolume struct {
 	opts      Options
 	stateDir  string
 	backupReg string
+	regUser   string
+	regPass   string
 
 	mu      sync.Mutex
 	servers map[string]*nbdServer // key: volumeUUID|hostUUID
 }
 
 // nbdServer tracks one running in-process NBD export for an attached volume.
+// Exactly one of pool (pool-backed mode) or overlay (OCI-overlay mode) is set;
+// img is the frozen base behind an overlay, retained so the export stays
+// readable and so the running overlay can be reached for Commit at snapshot time.
 type nbdServer struct {
-	ln   net.Listener
-	pool *pool.Pool
-	addr string        // "nbd://127.0.0.1:PORT"
-	done chan struct{} // closed when the Serve goroutine has fully drained
+	ln      net.Listener
+	pool    *pool.Pool
+	overlay *oci.Overlay
+	img     *oci.Image
+	addr    string        // "nbd://127.0.0.1:PORT"
+	done    chan struct{} // closed when the Serve goroutine has fully drained
 }
 
 // NewGoVolume constructs the go-volumes volume driver.
@@ -111,6 +125,8 @@ func NewGoVolume(o GoVolumeOptions) *GoVolume {
 		opts:      o.Options,
 		stateDir:  o.StateDir,
 		backupReg: o.BackupRegistry,
+		regUser:   o.RegistryUsername,
+		regPass:   o.RegistryPassword,
 		servers:   map[string]*nbdServer{},
 	}
 }
@@ -142,9 +158,14 @@ func attachKey(volumeUUID, hostUUID string) string { return volumeUUID + "|" + h
 // volume size is fixed at creation in this version, so a re-Ensure with a
 // larger size that the pool can't satisfy is reported rather than silently
 // ignored).
-func (v *GoVolume) EnsureVolume(_ context.Context, spec drivers.VolumeSpec) error {
+func (v *GoVolume) EnsureVolume(ctx context.Context, spec drivers.VolumeSpec) error {
 	if spec.UUID == "" {
 		return fmt.Errorf("govolume EnsureVolume: empty volume uuid")
+	}
+	// OCI-overlay mode: source is a frozen OCI base image. Dispatch to the
+	// overlay path, which sizes itself from the base (SizeGiB is advisory there).
+	if isOCISpec(spec) {
+		return v.ensureOCIVolume(ctx, spec)
 	}
 	if spec.SizeGiB <= 0 {
 		return fmt.Errorf("govolume EnsureVolume: size must be > 0 GiB")
@@ -213,7 +234,7 @@ func hasVolumePrefix(key, volumeUUID string) bool {
 // over a loopback TCP port and returns its nbd:// URI so the bundle attaches it
 // as `-drive file=nbd://127.0.0.1:PORT,if=virtio`. Idempotent per (volume,
 // host): a second attach returns the already-running server's address.
-func (v *GoVolume) AttachVolume(_ context.Context, volumeUUID, hostUUID string) (drivers.AttachedVolume, error) {
+func (v *GoVolume) AttachVolume(ctx context.Context, volumeUUID, hostUUID string) (drivers.AttachedVolume, error) {
 	if volumeUUID == "" {
 		return drivers.AttachedVolume{}, fmt.Errorf("govolume AttachVolume: empty volume uuid")
 	}
@@ -226,6 +247,12 @@ func (v *GoVolume) AttachVolume(_ context.Context, volumeUUID, hostUUID string) 
 		return drivers.AttachedVolume{BackingPath: addr}, nil
 	}
 	v.mu.Unlock()
+
+	// OCI-overlay mode: a sidecar records the base + current refs. Serve the
+	// in-memory overlay over the frozen base directly (no pool file).
+	if v.isOCIVolume(volumeUUID) {
+		return v.attachOCIVolume(ctx, volumeUUID, hostUUID, key)
+	}
 
 	path := v.poolPath(volumeUUID)
 	p, err := pool.Open(path)
@@ -284,6 +311,15 @@ func (s *nbdServer) close() error {
 			err = perr
 		}
 	}
+	// OCI-overlay mode: the overlay is in memory (Close is a no-op) and the
+	// frozen base only holds a registry client; both are released here. Dropped
+	// writes are intentional — durability is the explicit Commit at snapshot time.
+	if s.overlay != nil {
+		_ = s.overlay.Close()
+	}
+	if s.img != nil {
+		_ = s.img.Close()
+	}
 	return err
 }
 
@@ -306,9 +342,14 @@ func (v *GoVolume) DetachVolume(_ context.Context, volumeUUID, hostUUID string) 
 // CreateSnapshot freezes the live "disk" under spec.Name (or a timestamped
 // name if empty) via the pool's copy-on-write branching. The snapshot is a
 // read-only volume sharing the disk's blocks; subsequent writes copy-on-write.
-func (v *GoVolume) CreateSnapshot(_ context.Context, spec drivers.SnapshotSpec) (drivers.Snapshot, error) {
+func (v *GoVolume) CreateSnapshot(ctx context.Context, spec drivers.SnapshotSpec) (drivers.Snapshot, error) {
 	if spec.VolumeUUID == "" {
 		return drivers.Snapshot{}, fmt.Errorf("govolume CreateSnapshot: empty volume uuid")
+	}
+	// OCI-overlay mode: a snapshot is a Commit of the live overlay to a new
+	// versioned OCI tag (delta-deduped). Dispatch before the pool path.
+	if v.isOCIVolume(spec.VolumeUUID) {
+		return v.snapshotOCIVolume(ctx, spec)
 	}
 	name := spec.Name
 	if name == "" {
@@ -395,6 +436,12 @@ func (v *GoVolume) CreateBackup(ctx context.Context, spec drivers.BackupSpec) (d
 	if spec.VolumeUUID == "" || spec.SnapshotName == "" {
 		return drivers.Backup{}, fmt.Errorf("govolume CreateBackup: volume uuid and snapshot name are required")
 	}
+	// OCI-overlay mode: a backup is the same Commit primitive as a snapshot, but
+	// to the explicit BackupSpec.Target tag (which may live in a different repo /
+	// registry). Dispatch before the pool freeze path.
+	if v.isOCIVolume(spec.VolumeUUID) {
+		return v.backupOCIVolume(ctx, spec)
+	}
 	client, ref, err := v.registryFor(spec.Target)
 	if err != nil {
 		return drivers.Backup{}, err
@@ -431,6 +478,11 @@ func (v *GoVolume) CreateBackup(ctx context.Context, spec drivers.BackupSpec) (d
 func (v *GoVolume) RestoreBackup(ctx context.Context, backupURL string, spec drivers.VolumeSpec) error {
 	if spec.UUID == "" {
 		return fmt.Errorf("govolume RestoreBackup: empty target volume uuid")
+	}
+	// OCI-overlay restore / open-at-version: branch a fresh overlay from backupURL
+	// (any committed tag) into a new OCI-overlay volume. Selected by Format=="oci".
+	if spec.Format == ociFormat {
+		return v.restoreOCIVolume(ctx, backupURL, spec)
 	}
 	if fileExists(v.poolPath(spec.UUID)) {
 		return nil // already restored
@@ -566,7 +618,12 @@ func (v *GoVolume) registryFor(target string) (*registry.Client, string, error) 
 	if err != nil {
 		return nil, "", err
 	}
-	return &registry.Client{BaseURL: base, Repository: repo}, ref, nil
+	return &registry.Client{
+		BaseURL:    base,
+		Repository: repo,
+		Username:   v.regUser,
+		Password:   v.regPass,
+	}, ref, nil
 }
 
 // parseOCITarget splits an "oci://host[:port]/repo[/sub...]:tag" backup target

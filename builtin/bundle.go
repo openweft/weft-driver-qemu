@@ -38,6 +38,11 @@ type BundleOptions struct {
 	// BackupRegistry is the default OCI registry root for the govolume
 	// backend's backups (see GoVolumeOptions.BackupRegistry).
 	BackupRegistry string
+	// RegistryUsername and RegistryPassword authenticate the govolume backend to
+	// the OCI registry on freeze / restore and OCI-overlay open / commit. Empty
+	// → anonymous (see GoVolumeOptions.RegistryUsername).
+	RegistryUsername string
+	RegistryPassword string
 }
 
 // New returns the driver bundle for one QEMU host; all drivers share the same
@@ -51,9 +56,11 @@ func New(o BundleOptions) *Bundle {
 	volRoot := filepath.Join(stateDir, "volumes")
 	file := NewVolume(VolumeOptions{Options: o.Options, StateDir: volRoot})
 	gov := NewGoVolume(GoVolumeOptions{
-		Options:        o.Options,
-		StateDir:       filepath.Join(stateDir, "govolumes"),
-		BackupRegistry: o.BackupRegistry,
+		Options:          o.Options,
+		StateDir:         filepath.Join(stateDir, "govolumes"),
+		BackupRegistry:   o.BackupRegistry,
+		RegistryUsername: o.RegistryUsername,
+		RegistryPassword: o.RegistryPassword,
 	})
 	b := &Bundle{
 		Hypervisor: NewHypervisor(o.Options),
