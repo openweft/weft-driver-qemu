@@ -37,6 +37,14 @@ const (
 	envQemuAccel  = "WEFT_QEMU_ACCEL" // "kvm" on nested-virt hosts, else "tcg"
 	envQemuMemMiB = "WEFT_QEMU_DEFAULT_MEM_MIB"
 	envQemuCPUs   = "WEFT_QEMU_DEFAULT_CPUS"
+	// Volume backend selection. "" / "file" keeps the legacy host-file
+	// backend (default, unchanged). "govolume" activates the pure-Go
+	// go-volumes backend (CoW pool + in-process NBD attach + OCI
+	// freeze/restore) for the local microVM-disk niche.
+	envVolumeBackend = "WEFT_QEMU_VOLUME_BACKEND"
+	// Default OCI registry root for govolume backups (oci:// host part is
+	// taken from BackupSpec.Target; this is the fallback base URL).
+	envBackupRegistry = "WEFT_QEMU_BACKUP_REGISTRY"
 )
 
 func main() {
@@ -61,7 +69,9 @@ func main() {
 			DefaultMemMiB: defMem,
 			DefaultCPUs:   defCPUs,
 		},
-		StateDir: os.Getenv(weftplugin.EnvStateDir),
+		StateDir:       os.Getenv(weftplugin.EnvStateDir),
+		VolumeBackend:  os.Getenv(envVolumeBackend),
+		BackupRegistry: os.Getenv(envBackupRegistry),
 	})
 	weftplugin.Serve(weftplugin.DriverSet{
 		Hypervisor: b.Hypervisor,
