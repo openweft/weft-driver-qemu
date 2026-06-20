@@ -219,6 +219,45 @@ func TestBuildArgs_GPUPassthrough(t *testing.T) {
 	}
 }
 
+// FuzzBuildArgsPassthrough throws arbitrary strings at the PCI/MIG
+// passthrough lists. Invariants: buildArgs never panics, and whenever it
+// SUCCEEDS, no emitted `vfio-pci,...` device string is injectable — it
+// carries exactly one comma (the vfio-pci / property separator), no
+// whitespace, no second `=`-bearing property, and no `..`. This proves
+// validVFIOToken is sufficient rather than relying on hand-picked cases.
+func FuzzBuildArgsPassthrough(f *testing.F) {
+	f.Add("0000:65:00.0", "MIG-9c1e0001")
+	f.Add("0000:65:00.0,romfile=/etc/shadow", "MIG-x,host=0000:00:00.0")
+	f.Add("../../../pci/devices/0000:65:00.0", "MIG x")
+	f.Add("", "")
+	f.Fuzz(func(t *testing.T, pci, mig string) {
+		args, err := buildArgs(bootConfig{
+			arch: "x86_64", kernel: "/k",
+			pciPassthrough: []string{pci},
+			migPassthrough: []string{mig},
+		})
+		if err != nil {
+			return // rejection is fine; just must not panic
+		}
+		for _, a := range args {
+			if !strings.HasPrefix(a, "vfio-pci,") {
+				continue
+			}
+			rest := strings.TrimPrefix(a, "vfio-pci,")
+			if strings.ContainsAny(rest, ", \t\n\r") {
+				t.Fatalf("injectable vfio device emitted: %q (extra comma/whitespace)", a)
+			}
+			if strings.Contains(rest, "..") {
+				t.Fatalf("path traversal in vfio device: %q", a)
+			}
+			// Exactly one property → at most one '='.
+			if strings.Count(rest, "=") > 1 {
+				t.Fatalf("multiple properties in vfio device: %q", a)
+			}
+		}
+	})
+}
+
 func TestBuildArgs_RejectsVFIOInjection(t *testing.T) {
 	// qemu-option injection (comma → extra device property), argv
 	// corruption (space), key=val injection, and sysfs path traversal
