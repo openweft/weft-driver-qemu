@@ -219,6 +219,35 @@ func TestBuildArgs_GPUPassthrough(t *testing.T) {
 	}
 }
 
+func TestBuildArgs_RejectsVFIOInjection(t *testing.T) {
+	// qemu-option injection (comma → extra device property), argv
+	// corruption (space), key=val injection, and sysfs path traversal
+	// must all fail the build rather than render a dangerous -device.
+	bad := []string{
+		"0000:65:00.0,romfile=/etc/shadow",  // comma → injected property
+		"0000:65:00.0 -drive file=/etc",     // whitespace
+		"MIG-x,host=0000:00:00.0",           // pivot the vfio device
+		"../../../pci/devices/0000:65:00.0", // path traversal
+		"MIG-x=y",                           // '=' injection
+	}
+	for _, tok := range bad {
+		if _, err := buildArgs(bootConfig{arch: "x86_64", kernel: "/k", pciPassthrough: []string{tok}}); err == nil {
+			t.Errorf("pci passthrough %q should be rejected", tok)
+		}
+		if _, err := buildArgs(bootConfig{arch: "x86_64", kernel: "/k", migPassthrough: []string{tok}}); err == nil {
+			t.Errorf("mig passthrough %q should be rejected", tok)
+		}
+	}
+	// Canonical BDF + clean MIG UUID still pass.
+	if _, err := buildArgs(bootConfig{
+		arch: "x86_64", kernel: "/k",
+		pciPassthrough: []string{"0000:65:00.0"},
+		migPassthrough: []string{"MIG-9c1e0001-aaaa-bbbb-cccc-ddddeeeeffff"},
+	}); err != nil {
+		t.Errorf("legitimate BDF + MIG UUID must pass, got %v", err)
+	}
+}
+
 func TestBuildArgs_ShareRequiresTagAndPath(t *testing.T) {
 	if _, err := buildArgs(bootConfig{arch: "aarch64", kernel: "/k", shares: []shareArg{{path: "/p"}}}); err == nil {
 		t.Error("expected error when share tag is empty")

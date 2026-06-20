@@ -190,6 +190,9 @@ func buildArgs(b bootConfig) ([]string, error) {
 		if bdf == "" {
 			continue
 		}
+		if err := validVFIOToken(bdf); err != nil {
+			return nil, fmt.Errorf("qemu: pci passthrough %q: %w", bdf, err)
+		}
 		args = append(args, "-device", fmt.Sprintf("vfio-pci,host=%s", bdf))
 	}
 
@@ -199,6 +202,9 @@ func buildArgs(b bootConfig) ([]string, error) {
 	for _, uuid := range b.migPassthrough {
 		if uuid == "" {
 			continue
+		}
+		if err := validVFIOToken(uuid); err != nil {
+			return nil, fmt.Errorf("qemu: mig passthrough %q: %w", uuid, err)
 		}
 		args = append(args, "-device",
 			fmt.Sprintf("vfio-pci,sysfsdev=/sys/bus/mdev/devices/%s", uuid))
@@ -211,6 +217,26 @@ func buildArgs(b bootConfig) ([]string, error) {
 	}
 
 	return args, nil
+}
+
+// validVFIOToken rejects a host= / sysfsdev= token that could break out
+// of its qemu -device option or its sysfs path. These values are
+// host-derived (nvidia-smi / sysfs walk → GPUClaim → config.json), not
+// tenant-controlled, so this is defence in depth : even a malformed mdev
+// label or a tampered config.json then can't inject extra qemu device
+// properties (a `,key=val` rides the comma separator), corrupt the argv
+// (whitespace), or path-traverse out of /sys/bus/mdev/devices (`/` or
+// `..`). A canonical BDF ("0000:65:00.0") and a clean mdev UUID pass; a
+// malformed entry fails the VM start loudly rather than booting wrong or
+// extra hardware.
+func validVFIOToken(s string) error {
+	if strings.ContainsAny(s, ", \t\n\r=/") {
+		return fmt.Errorf("forbidden character (comma, whitespace, '=' or '/')")
+	}
+	if strings.Contains(s, "..") {
+		return fmt.Errorf("contains '..'")
+	}
+	return nil
 }
 
 // qemuBinary returns the qemu-system binary name for an arch.
