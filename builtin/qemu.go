@@ -128,6 +128,7 @@ func (h *Hypervisor) StartVM(_ context.Context, vmUUID string) error {
 		cmdline:     pickCmdline(cfg.Cmdline, defaultCmdline(h.opts.Arch)),
 		consolePath: filepath.Join(vmDir, "console.log"),
 		netUser:     true,
+		vsockCID:    cfg.VsockCID,
 	}
 	if initrd := filepath.Join(vmDir, "initrd"); fileExists(initrd) {
 		bc.initrd = initrd
@@ -301,6 +302,13 @@ type vmConfig struct {
 	MemMiB  int            `json:"mem_mib"`
 	MicroVM bool           `json:"microvm,omitempty"`
 	Shares  []shareEntryJS `json:"shares,omitempty"`
+	// VsockCID is the AF_VSOCK guest CID weft-agent allocated for
+	// this VM (deterministic hash, range [0x10000, 0xfffefffe]).
+	// When non-zero we append `-device vhost-vsock-pci,guest-cid=N`
+	// to the qemu argv so the guest's GuestPodPlane bidi stream
+	// surfaces with the exact CID GuestPodPlane.Attach's strict-
+	// when-known check expects. 0 = legacy VM ; no device.
+	VsockCID uint32 `json:"vsock_cid,omitempty"`
 }
 
 // shareEntryJS mirrors the (intentionally minimal) JSON shape weft's
