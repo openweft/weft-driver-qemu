@@ -135,6 +135,13 @@ func (h *Hypervisor) StartVM(_ context.Context, vmUUID string) error {
 	if disk := filepath.Join(vmDir, "disk.img"); fileExists(disk) {
 		bc.disks = append(bc.disks, diskArg{path: disk})
 	}
+	// GPU / PCI passthrough resolved upstream by weft-agent (the
+	// scheduler claims the concrete cards / MIG instances — see
+	// docs/operations/gpu-sharing.md). buildArgs renders one
+	// -device vfio-pci per entry ; the host's day-0 setup is
+	// responsible for the vfio binding / mdev creation.
+	bc.pciPassthrough = cfg.PCIPassthrough
+	bc.migPassthrough = cfg.MIGDevices
 	// microVM mode: wire each declared share over virtio-9p. weft's
 	// RegisterMicroVM writes config.json with {microvm:true, shares:[…]}
 	// — the Apple-VZ backend uses virtio-fs natively; here we surface
@@ -301,6 +308,15 @@ type vmConfig struct {
 	MemMiB  int            `json:"mem_mib"`
 	MicroVM bool           `json:"microvm,omitempty"`
 	Shares  []shareEntryJS `json:"shares,omitempty"`
+	// PCIPassthrough is the list of host PCI BDFs weft-agent resolved for
+	// this VM (whole-card GPUs / NICs / NVMe). Empty for the common no-
+	// passthrough VM. Rendered to -device vfio-pci,host=<BDF>.
+	PCIPassthrough []string `json:"pci_passthrough,omitempty"`
+	// MIGDevices is the list of NVIDIA MIG-instance mdev UUIDs claimed for
+	// this VM. Empty unless the VM requested an MIG slice. Rendered to
+	// -device vfio-pci,sysfsdev=/sys/bus/mdev/devices/<uuid>. See
+	// docs/operations/gpu-sharing.md.
+	MIGDevices []string `json:"mig_devices,omitempty"`
 }
 
 // shareEntryJS mirrors the (intentionally minimal) JSON shape weft's

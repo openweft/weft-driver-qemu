@@ -9,6 +9,15 @@ and this project aims to adhere to [Semantic Versioning](https://semver.org/spec
 
 ### Added
 
+- **NVIDIA MIG passthrough** : `bootConfig.migPassthrough` renders one
+  `-device vfio-pci,sysfsdev=/sys/bus/mdev/devices/<uuid>` per MIG-instance
+  mdev UUID — the mediated-device path a MIG slice needs (it isn't a whole
+  PCI function addressable by BDF like `pciPassthrough`). `StartVM` now
+  populates both `pciPassthrough` and `migPassthrough` from the VM
+  `config.json` (`pci_passthrough` / `mig_devices`), so host-resolved GPU
+  claims flow through to the qemu argv. Whole-card `-device`s are emitted
+  before MIG ones for a deterministic order. See weft's
+  `docs/operations/gpu-sharing.md`.
 - **`govolume` OCI-image-backed volume mode** : a second mode of
   the pure-Go `govolume` backend for the read-mostly golden-image
   / rootfs use case (the container-image model). A volume whose

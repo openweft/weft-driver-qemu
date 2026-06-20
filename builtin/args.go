@@ -45,6 +45,18 @@ type bootConfig struct {
 	// "device or resource busy" error if the BDF isn't actually
 	// available for passthrough.
 	pciPassthrough []string
+	// migPassthrough is the list of NVIDIA MIG-instance mediated-device
+	// UUIDs to pass through, one -device vfio-pci,sysfsdev=<path> per
+	// entry. A MIG slice is NOT a whole PCI function, so it can't be
+	// addressed by BDF like pciPassthrough ; it is a mediated device
+	// exposed under /sys/bus/mdev/devices/<uuid>, and QEMU's vfio-pci
+	// takes that sysfs path via `sysfsdev=`. The UUIDs come from the
+	// host's GPU inventory (weft's detectGPUs enumerates MIG instances
+	// on MIG-enabled cards) ; the scheduler claims a specific instance
+	// and weft-agent passes its UUID down. As with pciPassthrough the
+	// host's day-0 setup must have created the mdev + bound it to vfio ;
+	// buildArgs only renders the argv. See docs/operations/gpu-sharing.md.
+	migPassthrough []string
 }
 
 type diskArg struct {
@@ -179,6 +191,17 @@ func buildArgs(b bootConfig) ([]string, error) {
 			continue
 		}
 		args = append(args, "-device", fmt.Sprintf("vfio-pci,host=%s", bdf))
+	}
+
+	// MIG passthrough : one -device vfio-pci,sysfsdev=<mdev path> per
+	// instance UUID. Emitted after the whole-card BDFs so a VM that
+	// somehow requested both keeps a stable, deterministic device order.
+	for _, uuid := range b.migPassthrough {
+		if uuid == "" {
+			continue
+		}
+		args = append(args, "-device",
+			fmt.Sprintf("vfio-pci,sysfsdev=/sys/bus/mdev/devices/%s", uuid))
 	}
 
 	if b.consolePath != "" {

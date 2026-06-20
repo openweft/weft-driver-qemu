@@ -167,6 +167,58 @@ func TestBuildArgs_Virtio9PShares(t *testing.T) {
 	}
 }
 
+func TestBuildArgs_GPUPassthrough(t *testing.T) {
+	args, err := buildArgs(bootConfig{
+		arch:           "x86_64",
+		kernel:         "/k",
+		pciPassthrough: []string{"0000:65:00.0", "", "0000:b3:00.0"}, // empty entry skipped
+		migPassthrough: []string{"MIG-9c1e", "", "MIG-3a7f"},
+	})
+	if err != nil {
+		t.Fatalf("buildArgs: %v", err)
+	}
+	devs := argpairs(args, "-device")
+
+	// Whole-card BDFs → host=<BDF>, empty entry dropped.
+	wantHost := []string{"vfio-pci,host=0000:65:00.0", "vfio-pci,host=0000:b3:00.0"}
+	// MIG UUIDs → sysfsdev=/sys/bus/mdev/devices/<uuid>, empty dropped.
+	wantMdev := []string{
+		"vfio-pci,sysfsdev=/sys/bus/mdev/devices/MIG-9c1e",
+		"vfio-pci,sysfsdev=/sys/bus/mdev/devices/MIG-3a7f",
+	}
+	for _, w := range append(append([]string{}, wantHost...), wantMdev...) {
+		found := false
+		for _, d := range devs {
+			if d == w {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("missing -device %q in %v", w, devs)
+		}
+	}
+	// No empty / malformed vfio entries leaked through.
+	for _, d := range devs {
+		if strings.Contains(d, "host=,") || strings.HasSuffix(d, "host=") || strings.HasSuffix(d, "devices/") {
+			t.Errorf("empty passthrough entry leaked: %q", d)
+		}
+	}
+	// Whole cards must precede MIG devices (deterministic order).
+	firstMdev, firstHost := -1, -1
+	for i, d := range devs {
+		if firstHost == -1 && strings.Contains(d, "host=") {
+			firstHost = i
+		}
+		if firstMdev == -1 && strings.Contains(d, "sysfsdev=") {
+			firstMdev = i
+		}
+	}
+	if firstHost == -1 || firstMdev == -1 || firstHost > firstMdev {
+		t.Errorf("expected whole-card -device before MIG -device, host@%d mdev@%d", firstHost, firstMdev)
+	}
+}
+
 func TestBuildArgs_ShareRequiresTagAndPath(t *testing.T) {
 	if _, err := buildArgs(bootConfig{arch: "aarch64", kernel: "/k", shares: []shareArg{{path: "/p"}}}); err == nil {
 		t.Error("expected error when share tag is empty")
