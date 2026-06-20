@@ -1,12 +1,8 @@
 module github.com/openweft/weft-driver-qemu
 
-go 1.26.4
+go 1.26
 
 require (
-	github.com/go-volumes/interface v0.0.0-20260616111717-46702c78cec1
-	github.com/go-volumes/nbd v0.0.0-20260616111251-f19be2ffaec3
-	github.com/go-volumes/oci v0.0.0-20260616113719-8a595435690a
-	github.com/go-volumes/pool v0.0.0-20260616083804-68a26f7bfd51
 	github.com/openweft/weft-driver-plugin v0.0.0
 	github.com/openweft/weft-drivers v0.2.0
 	github.com/openweft/weft-slognats v0.3.0
