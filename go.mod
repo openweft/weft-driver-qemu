@@ -7,8 +7,8 @@ require (
 	github.com/go-volumes/nbd v0.0.0-20260619050303-a51d57cc0cac
 	github.com/go-volumes/oci v0.0.0-20260617044610-c2f09e512641
 	github.com/go-volumes/pool v0.0.0-20260619050308-7cb86de28bbd
-	github.com/openweft/weft-driver-plugin v0.4.0
-	github.com/openweft/weft-drivers v0.3.0
+	github.com/openweft/weft-driver-plugin v0.4.2
+	github.com/openweft/weft-drivers v0.4.0
 	github.com/openweft/weft-slognats v0.3.0
 )
 
