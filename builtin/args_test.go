@@ -296,6 +296,50 @@ func TestBuildArgs_ShareRequiresTagAndPath(t *testing.T) {
 	}
 }
 
+// TestBuildArgs_VsockDeviceWhenCIDSet asserts the virtio-vsock
+// argument is emitted iff bootConfig.vsockCID != 0 and carries the
+// exact CID weft-agent allocated — the GuestPodPlane strict-when-
+// known peer check on the agent side compares against this number,
+// so any drift here silently breaks every microVM Attach.
+func TestBuildArgs_VsockDeviceWhenCIDSet(t *testing.T) {
+	args, err := buildArgs(bootConfig{
+		arch:     "aarch64",
+		kernel:   "/k",
+		vsockCID: 4242,
+	})
+	if err != nil {
+		t.Fatalf("buildArgs: %v", err)
+	}
+	devs := argpairs(args, "-device")
+	found := false
+	for _, d := range devs {
+		if strings.Contains(d, "vhost-vsock-pci") {
+			if !strings.Contains(d, "guest-cid=4242") {
+				t.Errorf("vsock device missing guest-cid=4242: %q", d)
+			}
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected vhost-vsock-pci -device entry, got: %v", devs)
+	}
+}
+
+// TestBuildArgs_NoVsockDeviceWhenCIDZero pins the legacy-VM
+// permissive path : VsockCID=0 means "no vsock", no -device,
+// agent-side falls back to the non-reserved CID guard.
+func TestBuildArgs_NoVsockDeviceWhenCIDZero(t *testing.T) {
+	args, err := buildArgs(bootConfig{arch: "aarch64", kernel: "/k", vsockCID: 0})
+	if err != nil {
+		t.Fatalf("buildArgs: %v", err)
+	}
+	for _, d := range argpairs(args, "-device") {
+		if strings.Contains(d, "vhost-vsock-pci") {
+			t.Errorf("unexpected vhost-vsock-pci with CID=0: %q", d)
+		}
+	}
+}
+
 func TestArchMapping(t *testing.T) {
 	if hostArch("arm64") != "aarch64" || hostArch("amd64") != "x86_64" {
 		t.Error("hostArch mapping wrong")

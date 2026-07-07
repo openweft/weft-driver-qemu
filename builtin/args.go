@@ -57,6 +57,13 @@ type bootConfig struct {
 	// host's day-0 setup must have created the mdev + bound it to vfio ;
 	// buildArgs only renders the argv. See docs/operations/gpu-sharing.md.
 	migPassthrough []string
+	// vsockCID is the AF_VSOCK guest CID the weft agent allocated for
+	// the VM. 0 = unassigned (legacy VM ; skip the vsock device, fall
+	// back to the agent's permissive Hello-CID guard). Non-zero adds
+	// `-device vhost-vsock-pci,guest-cid=<vsockCID>` so the guest's
+	// GuestPodPlane bidi stream comes in over the expected CID and
+	// GuestPodPlane.Attach's strict-when-known check accepts it.
+	vsockCID uint32
 }
 
 type diskArg struct {
@@ -178,6 +185,18 @@ func buildArgs(b bootConfig) ([]string, error) {
 		}
 		dev := fmt.Sprintf("virtio-9p-pci,fsdev=%s,mount_tag=%s", fsID, s.tag)
 		args = append(args, "-fsdev", fsdev, "-device", dev)
+	}
+
+	// virtio-vsock device. Bound to the agent-allocated guest CID so
+	// GuestPodPlane.Attach can verify the announced pod_id matches
+	// this exact CID (strict-when-known peer check). Skipped when
+	// vsockCID == 0 (legacy VMs ; the agent's permissive guard runs
+	// instead). The host kernel must have the vhost_vsock module
+	// loaded ; absent that, QEMU returns an init failure that
+	// surfaces in the VM's monitor.log.
+	if b.vsockCID != 0 {
+		args = append(args, "-device",
+			fmt.Sprintf("vhost-vsock-pci,guest-cid=%d", b.vsockCID))
 	}
 
 	// PCI passthrough : one -device vfio-pci per resolved BDF. Order

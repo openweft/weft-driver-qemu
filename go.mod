@@ -3,12 +3,12 @@ module github.com/openweft/weft-driver-qemu
 go 1.26.4
 
 require (
-	github.com/go-volumes/interface v0.0.0-20260616111717-46702c78cec1
-	github.com/go-volumes/nbd v0.0.0-20260616111251-f19be2ffaec3
-	github.com/go-volumes/oci v0.0.0-20260616113719-8a595435690a
-	github.com/go-volumes/pool v0.0.0-20260616083804-68a26f7bfd51
-	github.com/openweft/weft-driver-plugin v0.0.0
-	github.com/openweft/weft-drivers v0.2.0
+	github.com/go-volumes/interface v0.0.0-20260619050259-05f3e84c2ec1
+	github.com/go-volumes/nbd v0.0.0-20260619050303-a51d57cc0cac
+	github.com/go-volumes/oci v0.0.0-20260617044610-c2f09e512641
+	github.com/go-volumes/pool v0.0.0-20260619050308-7cb86de28bbd
+	github.com/openweft/weft-driver-plugin v0.4.2
+	github.com/openweft/weft-drivers v0.4.0
 	github.com/openweft/weft-slognats v0.3.0
 )
 
@@ -32,9 +32,4 @@ require (
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260226221140-a57be14db171 // indirect
 	google.golang.org/grpc v1.81.1 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
-)
-
-replace (
-	github.com/openweft/weft-driver-plugin => ../weft-driver-plugin
-	github.com/openweft/weft-drivers => ../weft-drivers
 )
