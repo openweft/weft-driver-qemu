@@ -167,6 +167,126 @@ func TestBuildArgs_Virtio9PShares(t *testing.T) {
 	}
 }
 
+func TestBuildArgs_GPUPassthrough(t *testing.T) {
+	args, err := buildArgs(bootConfig{
+		arch:           "x86_64",
+		kernel:         "/k",
+		pciPassthrough: []string{"0000:65:00.0", "", "0000:b3:00.0"}, // empty entry skipped
+		migPassthrough: []string{"MIG-9c1e", "", "MIG-3a7f"},
+	})
+	if err != nil {
+		t.Fatalf("buildArgs: %v", err)
+	}
+	devs := argpairs(args, "-device")
+
+	// Whole-card BDFs → host=<BDF>, empty entry dropped.
+	wantHost := []string{"vfio-pci,host=0000:65:00.0", "vfio-pci,host=0000:b3:00.0"}
+	// MIG UUIDs → sysfsdev=/sys/bus/mdev/devices/<uuid>, empty dropped.
+	wantMdev := []string{
+		"vfio-pci,sysfsdev=/sys/bus/mdev/devices/MIG-9c1e",
+		"vfio-pci,sysfsdev=/sys/bus/mdev/devices/MIG-3a7f",
+	}
+	for _, w := range append(append([]string{}, wantHost...), wantMdev...) {
+		found := false
+		for _, d := range devs {
+			if d == w {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("missing -device %q in %v", w, devs)
+		}
+	}
+	// No empty / malformed vfio entries leaked through.
+	for _, d := range devs {
+		if strings.Contains(d, "host=,") || strings.HasSuffix(d, "host=") || strings.HasSuffix(d, "devices/") {
+			t.Errorf("empty passthrough entry leaked: %q", d)
+		}
+	}
+	// Whole cards must precede MIG devices (deterministic order).
+	firstMdev, firstHost := -1, -1
+	for i, d := range devs {
+		if firstHost == -1 && strings.Contains(d, "host=") {
+			firstHost = i
+		}
+		if firstMdev == -1 && strings.Contains(d, "sysfsdev=") {
+			firstMdev = i
+		}
+	}
+	if firstHost == -1 || firstMdev == -1 || firstHost > firstMdev {
+		t.Errorf("expected whole-card -device before MIG -device, host@%d mdev@%d", firstHost, firstMdev)
+	}
+}
+
+// FuzzBuildArgsPassthrough throws arbitrary strings at the PCI/MIG
+// passthrough lists. Invariants: buildArgs never panics, and whenever it
+// SUCCEEDS, no emitted `vfio-pci,...` device string is injectable — it
+// carries exactly one comma (the vfio-pci / property separator), no
+// whitespace, no second `=`-bearing property, and no `..`. This proves
+// validVFIOToken is sufficient rather than relying on hand-picked cases.
+func FuzzBuildArgsPassthrough(f *testing.F) {
+	f.Add("0000:65:00.0", "MIG-9c1e0001")
+	f.Add("0000:65:00.0,romfile=/etc/shadow", "MIG-x,host=0000:00:00.0")
+	f.Add("../../../pci/devices/0000:65:00.0", "MIG x")
+	f.Add("", "")
+	f.Fuzz(func(t *testing.T, pci, mig string) {
+		args, err := buildArgs(bootConfig{
+			arch: "x86_64", kernel: "/k",
+			pciPassthrough: []string{pci},
+			migPassthrough: []string{mig},
+		})
+		if err != nil {
+			return // rejection is fine; just must not panic
+		}
+		for _, a := range args {
+			if !strings.HasPrefix(a, "vfio-pci,") {
+				continue
+			}
+			rest := strings.TrimPrefix(a, "vfio-pci,")
+			if strings.ContainsAny(rest, ", \t\n\r") {
+				t.Fatalf("injectable vfio device emitted: %q (extra comma/whitespace)", a)
+			}
+			if strings.Contains(rest, "..") {
+				t.Fatalf("path traversal in vfio device: %q", a)
+			}
+			// Exactly one property → at most one '='.
+			if strings.Count(rest, "=") > 1 {
+				t.Fatalf("multiple properties in vfio device: %q", a)
+			}
+		}
+	})
+}
+
+func TestBuildArgs_RejectsVFIOInjection(t *testing.T) {
+	// qemu-option injection (comma → extra device property), argv
+	// corruption (space), key=val injection, and sysfs path traversal
+	// must all fail the build rather than render a dangerous -device.
+	bad := []string{
+		"0000:65:00.0,romfile=/etc/shadow",  // comma → injected property
+		"0000:65:00.0 -drive file=/etc",     // whitespace
+		"MIG-x,host=0000:00:00.0",           // pivot the vfio device
+		"../../../pci/devices/0000:65:00.0", // path traversal
+		"MIG-x=y",                           // '=' injection
+	}
+	for _, tok := range bad {
+		if _, err := buildArgs(bootConfig{arch: "x86_64", kernel: "/k", pciPassthrough: []string{tok}}); err == nil {
+			t.Errorf("pci passthrough %q should be rejected", tok)
+		}
+		if _, err := buildArgs(bootConfig{arch: "x86_64", kernel: "/k", migPassthrough: []string{tok}}); err == nil {
+			t.Errorf("mig passthrough %q should be rejected", tok)
+		}
+	}
+	// Canonical BDF + clean MIG UUID still pass.
+	if _, err := buildArgs(bootConfig{
+		arch: "x86_64", kernel: "/k",
+		pciPassthrough: []string{"0000:65:00.0"},
+		migPassthrough: []string{"MIG-9c1e0001-aaaa-bbbb-cccc-ddddeeeeffff"},
+	}); err != nil {
+		t.Errorf("legitimate BDF + MIG UUID must pass, got %v", err)
+	}
+}
+
 func TestBuildArgs_ShareRequiresTagAndPath(t *testing.T) {
 	if _, err := buildArgs(bootConfig{arch: "aarch64", kernel: "/k", shares: []shareArg{{path: "/p"}}}); err == nil {
 		t.Error("expected error when share tag is empty")

@@ -7,6 +7,39 @@ and this project aims to adhere to [Semantic Versioning](https://semver.org/spec
 
 ## [Unreleased]
 
+### Added
+
+- **NVIDIA MIG passthrough** : `bootConfig.migPassthrough` renders one
+  `-device vfio-pci,sysfsdev=/sys/bus/mdev/devices/<uuid>` per MIG-instance
+  mdev UUID — the mediated-device path a MIG slice needs (it isn't a whole
+  PCI function addressable by BDF like `pciPassthrough`). `StartVM` now
+  populates both `pciPassthrough` and `migPassthrough` from the VM
+  `config.json` (`pci_passthrough` / `mig_devices`), so host-resolved GPU
+  claims flow through to the qemu argv. Whole-card `-device`s are emitted
+  before MIG ones for a deterministic order. See weft's
+  `docs/operations/gpu-sharing.md`.
+- **`govolume` OCI-image-backed volume mode** : a second mode of
+  the pure-Go `govolume` backend for the read-mostly golden-image
+  / rootfs use case (the container-image model). A volume whose
+  `VolumeSpec.Format` is `"oci"` carries a frozen OCI base ref in
+  `VolumeSpec.Name` (`oci://host/repo:tag`); `EnsureVolume` opens
+  it read-only (`oci.OpenReadOnly`) and records a `base` + `current`
+  sidecar. `AttachVolume` wraps the frozen base in an in-memory
+  read-write `oci.Overlay` and serves THAT overlay over the
+  in-process NBD export, so QEMU boots the golden image
+  read-write. `CreateSnapshot` / `CreateBackup` call
+  `Overlay.Commit`, snapshotting the live overlay into a NEW
+  immutable, delta-deduped OCI tag (only changed chunks are
+  pushed) and advancing `current`; `RestoreBackup` branches a
+  fresh overlay volume from any committed tag. Reuses
+  `WEFT_QEMU_BACKUP_REGISTRY` (+ new optional `_USERNAME` /
+  `_PASSWORD` creds). The overlay is in memory — written bytes are
+  ephemeral until Commit and RAM grows with the WRITTEN delta, not
+  the base size — so this mode targets immutable base + small
+  writable layer + versioned snapshots, NOT write-heavy data
+  volumes (those keep the existing CoW-pool + freeze-backup path,
+  untouched). 100 % covered.
+
 ### Fixed
 
 - **Atomic `exit.json` write + stale clear on restart** : the
