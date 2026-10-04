@@ -37,7 +37,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.25'
+          go-version: '1.27.1'
 
       - name: Cross-compile the plugin for every target
         run: |
