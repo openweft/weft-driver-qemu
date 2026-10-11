@@ -18,7 +18,7 @@ require (
 	github.com/hashicorp/go-hclog v0.14.1 // indirect
 	github.com/hashicorp/go-plugin v1.6.2 // indirect
 	github.com/hashicorp/yamux v0.1.1 // indirect
-	github.com/klauspost/compress v1.18.0 // indirect
+	github.com/klauspost/compress v1.18.7 // indirect
 	github.com/mattn/go-colorable v0.1.4 // indirect
 	github.com/mattn/go-isatty v0.0.17 // indirect
 	github.com/nats-io/nats.go v1.43.0 // indirect
