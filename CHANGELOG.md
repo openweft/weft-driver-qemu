@@ -9,6 +9,18 @@ and this project aims to adhere to [Semantic Versioning](https://semver.org/spec
 
 ### Added
 
+- **Per-boot token delivery** : `Hypervisor.StartVMWithBootToken`
+  (`drivers.BootTokenStarter`, weft-drivers v0.7.0 / weft-driver-plugin
+  v0.7.0). The 32-byte token goes to the guest as a QEMU fw_cfg blob,
+  `-fw_cfg name=opt/org.weft/boot-token,file=/dev/fd/3`, where fd 3 is the
+  read end of an anonymous pipe passed through `exec.Cmd.ExtraFiles`: the
+  argv carries only the fd path, nothing touches a disk, and the token is
+  never logged nor put in an error. In the guest it is readable (root only)
+  at `/sys/firmware/qemu_fw_cfg/by_name/opt/org.weft/boot-token/raw`, which
+  needs `CONFIG_FW_CFG_SYSFS`. `StartVM` is unchanged (no token); both share
+  one launcher, and an already-running VM makes the call a no-op (token
+  ignored).
+
 - **NVIDIA MIG passthrough** : `bootConfig.migPassthrough` renders one
   `-device vfio-pci,sysfsdev=/sys/bus/mdev/devices/<uuid>` per MIG-instance
   mdev UUID — the mediated-device path a MIG slice needs (it isn't a whole

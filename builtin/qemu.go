@@ -57,7 +57,10 @@ type Hypervisor struct {
 }
 
 // compile-time conformance.
-var _ drivers.HypervisorDriver = (*Hypervisor)(nil)
+var (
+	_ drivers.HypervisorDriver = (*Hypervisor)(nil)
+	_ drivers.BootTokenStarter = (*Hypervisor)(nil)
+)
 
 // NewHypervisor constructs the driver, filling in host-derived defaults.
 func NewHypervisor(o Options) *Hypervisor {
@@ -103,7 +106,28 @@ func (h *Hypervisor) CreateVM(_ context.Context, spec drivers.VMSpec) error {
 // qemu-system process, recording its PID. Idempotent: an already-running VM
 // (live vm.pid) is a no-op.
 func (h *Hypervisor) StartVM(_ context.Context, vmUUID string) error {
-	vmDir := vmUUID
+	return h.start(vmUUID, nil)
+}
+
+// StartVMWithBootToken is StartVM plus a per-boot secret delivered to the
+// guest as a QEMU fw_cfg blob (opt/org.weft/boot-token). The 32 token bytes
+// travel through an anonymous pipe inherited by qemu as fd 3 and read once by
+// QEMU at startup (`-fw_cfg name=…,file=/dev/fd/3`): nothing touches a disk,
+// and the argv holds only the fd path, never the token. The token is never
+// logged, wrapped in an error or written to the VM directory.
+//
+// Idempotent like StartVM: if the VM is already running the call is a no-op
+// and the token is ignored (the running guest keeps the token it booted with).
+func (h *Hypervisor) StartVMWithBootToken(_ context.Context, vmUUID string, token []byte) error {
+	if err := drivers.ValidateBootToken(token); err != nil {
+		return err
+	}
+	return h.start(vmUUID, token)
+}
+
+// start is the shared launcher. A nil token launches without the fw_cfg
+// pipe; otherwise token must already be validated.
+func (h *Hypervisor) start(vmDir string, token []byte) error {
 	if alive, _ := pidAlive(vmDir); alive {
 		return nil
 	}
@@ -160,6 +184,8 @@ func (h *Hypervisor) StartVM(_ context.Context, vmUUID string) error {
 		bc.cmdline = rewriteCmdlineForQEMU(bc.cmdline)
 	}
 
+	bc.bootTokenFD = token != nil
+
 	args, err := buildArgs(bc)
 	if err != nil {
 		return fmt.Errorf("qemu StartVM: %w", err)
@@ -169,8 +195,21 @@ func (h *Hypervisor) StartVM(_ context.Context, vmUUID string) error {
 	// Detach from the agent's session so the VM outlives a single RPC and
 	// isn't killed by a SIGHUP to the agent.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("qemu StartVM: launch %s: %w", h.opts.QemuBinary, err)
+	var tokenR *os.File
+	if token != nil {
+		r, err := feedToken(token)
+		if err != nil {
+			return fmt.Errorf("qemu StartVM: boot token pipe: %w", err)
+		}
+		tokenR = r
+		cmd.ExtraFiles = []*os.File{r} // becomes fd 3 in qemu
+	}
+	startErr := cmd.Start()
+	if tokenR != nil {
+		_ = tokenR.Close() // the child holds its own copy now
+	}
+	if startErr != nil {
+		return fmt.Errorf("qemu StartVM: launch %s: %w", h.opts.QemuBinary, startErr)
 	}
 	pid := cmd.Process.Pid
 	if err := os.WriteFile(filepath.Join(vmDir, "vm.pid"), []byte(strconv.Itoa(pid)), 0o600); err != nil {
@@ -210,6 +249,26 @@ func (h *Hypervisor) StartVM(_ context.Context, vmUUID string) error {
 	}()
 	return nil
 }
+
+// feedToken returns the read end of an anonymous pipe already holding token,
+// with the write end closed. The pipe buffer (>= 4 KiB) is far larger than the
+// 32-byte token, so the write cannot block. Errors never contain the token.
+func feedToken(token []byte) (*os.File, error) {
+	r, w, err := osPipe()
+	if err != nil {
+		return nil, err
+	}
+	_, err = w.Write(token)
+	_ = w.Close() // closing a pipe's write end after a successful write cannot lose data
+	if err != nil {
+		_ = r.Close()
+		return nil, err
+	}
+	return r, nil
+}
+
+// osPipe is os.Pipe, replaceable by tests to reach the failure paths.
+var osPipe = os.Pipe
 
 // StopVM sends SIGTERM to the qemu process. Idempotent: a missing or
 // already-dead VM is a no-op.

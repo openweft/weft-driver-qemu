@@ -64,7 +64,21 @@ type bootConfig struct {
 	// GuestPodPlane bidi stream comes in over the expected CID and
 	// GuestPodPlane.Attach's strict-when-known check accepts it.
 	vsockCID uint32
+	// bootTokenFD, when true, adds a fw_cfg blob read from /dev/fd/3 (the
+	// first exec.Cmd.ExtraFiles entry: the read end of the pipe the
+	// launcher fills with the per-boot token). The argv carries only that
+	// fd path, never the token. In the guest the blob appears at
+	// /sys/firmware/qemu_fw_cfg/by_name/opt/org.weft/boot-token/raw
+	// (root only; needs CONFIG_FW_CFG_SYSFS).
+	bootTokenFD bool
 }
+
+// bootTokenFwCfg is the fw_cfg item name and bootTokenFDPath the child-side
+// path of the pipe that feeds it.
+const (
+	bootTokenFwCfgName = "opt/org.weft/boot-token"
+	bootTokenFDPath    = "/dev/fd/3"
+)
 
 type diskArg struct {
 	path     string
@@ -227,6 +241,11 @@ func buildArgs(b bootConfig) ([]string, error) {
 		}
 		args = append(args, "-device",
 			fmt.Sprintf("vfio-pci,sysfsdev=/sys/bus/mdev/devices/%s", uuid))
+	}
+
+	if b.bootTokenFD {
+		args = append(args, "-fw_cfg",
+			"name="+bootTokenFwCfgName+",file="+bootTokenFDPath)
 	}
 
 	if b.consolePath != "" {
