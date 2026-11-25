@@ -231,3 +231,35 @@ func TestBuildArgs_BootTokenFD(t *testing.T) {
 		t.Errorf("missing %q in %v", want, args)
 	}
 }
+
+func TestFeedToken_PipeFailure(t *testing.T) {
+	boom := errors.New("pipe boom")
+	osPipe = func() (*os.File, *os.File, error) { return nil, nil, boom }
+	defer func() { osPipe = os.Pipe }()
+	if _, err := feedToken(testToken()); !errors.Is(err, boom) {
+		t.Errorf("err = %v", err)
+	}
+	// And through the launcher: no qemu may start.
+	h, vmDir, out := fakeVM(t)
+	if err := h.StartVMWithBootToken(context.Background(), vmDir, testToken()); !errors.Is(err, boom) {
+		t.Errorf("launcher err = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(out, "argv.bin")); err == nil {
+		t.Error("qemu started without its token pipe")
+	}
+}
+
+func TestFeedToken_WriteFailure(t *testing.T) {
+	osPipe = func() (*os.File, *os.File, error) {
+		r, w, err := os.Pipe()
+		if err == nil {
+			_ = w.Close() // writing to a closed file fails
+		}
+		return r, w, err
+	}
+	defer func() { osPipe = os.Pipe }()
+	r, err := feedToken(testToken())
+	if err == nil || r != nil {
+		t.Fatalf("got %v, %v; want an error and no reader", r, err)
+	}
+}

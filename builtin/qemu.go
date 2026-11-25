@@ -254,21 +254,21 @@ func (h *Hypervisor) start(vmDir string, token []byte) error {
 // with the write end closed. The pipe buffer (>= 4 KiB) is far larger than the
 // 32-byte token, so the write cannot block. Errors never contain the token.
 func feedToken(token []byte) (*os.File, error) {
-	r, w, err := os.Pipe()
+	r, w, err := osPipe()
 	if err != nil {
 		return nil, err
 	}
 	_, err = w.Write(token)
-	cerr := w.Close()
-	if err == nil {
-		err = cerr
-	}
+	_ = w.Close() // closing a pipe's write end after a successful write cannot lose data
 	if err != nil {
 		_ = r.Close()
 		return nil, err
 	}
 	return r, nil
 }
+
+// osPipe is os.Pipe, replaceable by tests to reach the failure paths.
+var osPipe = os.Pipe
 
 // StopVM sends SIGTERM to the qemu process. Idempotent: a missing or
 // already-dead VM is a no-op.
